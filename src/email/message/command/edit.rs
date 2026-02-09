@@ -4,7 +4,7 @@ use clap::Parser;
 use color_eyre::{eyre::eyre, Result};
 use email::{backend::feature::BackendFeatureSource, config::Config};
 use pimalaya_tui::{
-    himalaya::{backend::BackendBuilder, editor},
+    himalaya::backend::BackendBuilder,
     terminal::{cli::printer::Printer, config::TomlConfig as _},
 };
 use tracing::info;
@@ -96,7 +96,7 @@ impl MessageEditCommand {
 
         crate::from_override::inject_cc_in_tpl(&mut tpl.content);
 
-        editor::edit_tpl_with_editor(account_config, printer, &backend, tpl).await?;
+        crate::editor_wrapper::edit_tpl_with_editor(account_config, printer, &backend, tpl).await?;
 
         if self.on_place {
             backend.delete_messages(folder, &[id]).await?;

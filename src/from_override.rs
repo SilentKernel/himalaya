@@ -2,6 +2,7 @@ use email::account::config::AccountConfig;
 
 const FROM_EMAIL: Option<&str> = option_env!("HIMALAYA_FROM_EMAIL");
 const FROM_NAME: Option<&str> = option_env!("HIMALAYA_FROM_NAME");
+const DOMAIN: Option<&str> = option_env!("HIMALAYA_DOMAIN");
 
 /// Override `AccountConfig` email/display_name with compile-time values.
 pub fn apply_from_override(config: &mut AccountConfig) {
@@ -259,18 +260,81 @@ pub fn inject_cc_in_tpl(content: &mut String) {
     }
 }
 
-/// Always inject fresh `Date:`, `Message-ID:`, and `MIME-Version:` headers
-/// into a raw RFC 5322 message. If any of these headers already exist, they
-/// are removed and replaced with fresh values. New headers are inserted
-/// just before the header/body separator (the first blank line).
+/// Encode a byte slice using RFC 2045 quoted-printable encoding.
+///
+/// - Printable ASCII bytes (33..=126, except `=`) pass through.
+/// - Space and tab pass through unless they appear at end of a line.
+/// - Everything else is encoded as `=XX` (uppercase hex).
+/// - Lines are soft-wrapped at 76 characters with `=\r\n`.
+fn quoted_printable_encode_body(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len() * 2);
+    let mut col: usize = 0;
+
+    for &b in input {
+        if b == b'\r' {
+            continue;
+        }
+        if b == b'\n' {
+            // Trim trailing whitespace before the line break:
+            // if last char on this line is space/tab, encode it.
+            if let Some(last) = out.last().copied() {
+                if last == b' ' || last == b'\t' {
+                    out.pop();
+                    let hex = format!("={:02X}", last);
+                    out.extend_from_slice(hex.as_bytes());
+                }
+            }
+            out.extend_from_slice(b"\r\n");
+            col = 0;
+            continue;
+        }
+
+        // Determine encoded form of this byte.
+        let encoded: Vec<u8> = if b == b'=' {
+            b"=3D".to_vec()
+        } else if (33..=126).contains(&b) {
+            vec![b]
+        } else if b == b' ' || b == b'\t' {
+            vec![b]
+        } else {
+            format!("={:02X}", b).into_bytes()
+        };
+
+        // Soft line break if this token would exceed 76 chars.
+        // Reserve 1 char for a potential trailing `=` soft break marker.
+        if col + encoded.len() > 75 {
+            out.extend_from_slice(b"=\r\n");
+            col = 0;
+        }
+
+        out.extend_from_slice(&encoded);
+        col += encoded.len();
+    }
+
+    out
+}
+
+/// Always inject fresh `Date:`, `Message-ID:`, `MIME-Version:`,
+/// `X-Mailer:`, and `Content-Transfer-Encoding:` headers into a raw
+/// RFC 5322 message, matching Apple Mail's header fingerprint.
+///
+/// If the message body is not multipart, re-encode it as
+/// quoted-printable and inject a `Content-Type` with charset if
+/// missing.
 pub fn inject_missing_headers(msg: &[u8]) -> Vec<u8> {
-    use chrono::Utc;
+    use chrono::Local;
     use uuid::Uuid;
 
     let src = String::from_utf8_lossy(msg);
 
-    // Names of headers we want to replace (lowercase for comparison).
-    const TARGETS: &[&str] = &["date:", "message-id:", "mime-version:"];
+    // Headers we strip and replace (lowercase for comparison).
+    const TARGETS: &[&str] = &[
+        "date:",
+        "message-id:",
+        "mime-version:",
+        "x-mailer:",
+        "content-transfer-encoding:",
+    ];
 
     // Collect non-target header lines + track where the body starts.
     let mut header_lines: Vec<&str> = Vec::new();
@@ -278,6 +342,8 @@ pub fn inject_missing_headers(msg: &[u8]) -> Vec<u8> {
     let mut body_start: Option<usize> = None;
     let mut pos: usize = 0;
     let mut skip_folded = false;
+    let mut has_content_type = false;
+    let mut is_multipart = false;
 
     for line in lines.by_ref() {
         let line_start = pos;
@@ -292,13 +358,20 @@ pub fn inject_missing_headers(msg: &[u8]) -> Vec<u8> {
 
         if skip_folded {
             if line.starts_with(' ') || line.starts_with('\t') {
-                // Folded continuation of a target header — skip it.
                 continue;
             }
             skip_folded = false;
         }
 
         let lower = line.to_ascii_lowercase();
+
+        if lower.starts_with("content-type:") {
+            has_content_type = true;
+            if lower.contains("multipart/") {
+                is_multipart = true;
+            }
+        }
+
         if TARGETS.iter().any(|t| lower.starts_with(t)) {
             skip_folded = true;
             continue;
@@ -307,23 +380,56 @@ pub fn inject_missing_headers(msg: &[u8]) -> Vec<u8> {
         header_lines.push(line);
     }
 
-    // Build replacement headers.
-    let date = Utc::now().format("%a, %d %b %Y %H:%M:%S %z");
-    let msg_id = format!("<{}@localhost>", Uuid::new_v4());
+    // Build replacement headers (Apple Mail style).
+    let date = Local::now().format("%a, %d %b %Y %H:%M:%S %z");
+    let domain = DOMAIN.unwrap_or("localhost");
+    let msg_id = format!(
+        "<{}@{}>",
+        Uuid::new_v4().to_string().to_uppercase(),
+        domain
+    );
 
-    let mut result = String::with_capacity(src.len() + 128);
+    let mut result = String::with_capacity(src.len() + 256);
 
     for line in &header_lines {
         result.push_str(line);
     }
 
+    // Inject Content-Type if not already present (and not multipart).
+    if !has_content_type {
+        result.push_str("Content-Type: text/plain; charset=utf-8\r\n");
+    }
+
+    // Only inject CTE for non-multipart messages.
+    if !is_multipart {
+        result.push_str("Content-Transfer-Encoding: quoted-printable\r\n");
+    }
+
     result.push_str(&format!("Date: {}\r\n", date));
     result.push_str(&format!("Message-ID: {}\r\n", msg_id));
-    result.push_str("MIME-Version: 1.0\r\n");
+    result.push_str(
+        "MIME-Version: 1.0 (Mac OS X Mail 16.0 (3864.300.41.1.7))\r\n",
+    );
+    result.push_str("X-Mailer: Apple Mail (2.3864.300.41.1.7)\r\n");
 
     // Re-append the blank separator and body.
     if let Some(sep) = body_start {
-        result.push_str(&src[sep..]);
+        if is_multipart {
+            // Multipart: keep the body as-is.
+            result.push_str(&src[sep..]);
+        } else {
+            // Re-encode the body as quoted-printable.
+            result.push_str("\r\n");
+            let body_content = &src[sep..];
+            // Skip the blank separator line itself.
+            let body_after_sep = if let Some(idx) = body_content.find('\n') {
+                &body_content[idx + 1..]
+            } else {
+                ""
+            };
+            let encoded = quoted_printable_encode_body(body_after_sep.as_bytes());
+            result.push_str(&String::from_utf8_lossy(&encoded));
+        }
     }
 
     result.into_bytes()
@@ -543,33 +649,50 @@ mod tests {
         let text = String::from_utf8(result).unwrap();
         assert!(text.contains("Date: "));
         assert!(text.contains("Message-ID: <"));
-        assert!(text.contains("MIME-Version: 1.0"));
+        // Apple Mail style MIME-Version with comment
+        assert!(text.contains("MIME-Version: 1.0 (Mac OS X Mail 16.0"));
+        // X-Mailer header
+        assert!(text.contains("X-Mailer: Apple Mail"));
+        // Content-Transfer-Encoding
+        assert!(text.contains("Content-Transfer-Encoding: quoted-printable"));
+        // Content-Type injected when missing
+        assert!(text.contains("Content-Type: text/plain; charset=utf-8"));
         // Original headers preserved
         assert!(text.contains("From: a@example.com"));
         assert!(text.contains("Subject: hi"));
+        // Message-ID uses uppercase UUID
+        let mid_start = text.find("Message-ID: <").unwrap() + "Message-ID: <".len();
+        let mid_end = text[mid_start..].find('@').unwrap();
+        let uuid_part = &text[mid_start..mid_start + mid_end];
+        assert_eq!(uuid_part, uuid_part.to_uppercase());
     }
 
     #[test]
     fn inject_headers_replaces_existing() {
-        let msg = b"From: a@example.com\r\nDate: Thu, 01 Jan 1970 00:00:00 +0000\r\nMessage-ID: <old@old>\r\nMIME-Version: 1.0\r\nSubject: hi\r\n\r\nBody";
+        let msg = b"From: a@example.com\r\nDate: Thu, 01 Jan 1970 00:00:00 +0000\r\nMessage-ID: <old@old>\r\nMIME-Version: 1.0\r\nX-Mailer: OldMailer\r\nContent-Transfer-Encoding: 8bit\r\nSubject: hi\r\n\r\nBody";
         let result = inject_missing_headers(msg);
         let text = String::from_utf8(result).unwrap();
         // Old values should be gone
         assert!(!text.contains("Thu, 01 Jan 1970"));
         assert!(!text.contains("<old@old>"));
-        // Fresh values should be present
+        assert!(!text.contains("OldMailer"));
+        assert!(!text.contains("8bit"));
+        // Fresh Apple Mail values should be present
         assert!(text.contains("Date: "));
         assert!(text.contains("Message-ID: <"));
-        assert!(text.contains("MIME-Version: 1.0"));
+        assert!(text.contains("MIME-Version: 1.0 (Mac OS X Mail 16.0"));
+        assert!(text.contains("X-Mailer: Apple Mail"));
+        assert!(text.contains("Content-Transfer-Encoding: quoted-printable"));
     }
 
     #[test]
-    fn inject_headers_preserves_body() {
-        let body = "This is the body\r\nwith multiple lines\r\nand stuff.";
+    fn inject_headers_preserves_body_qp_encoded() {
+        let body = "Hello world";
         let msg = format!("From: a@example.com\r\nSubject: hi\r\n\r\n{}", body);
         let result = inject_missing_headers(msg.as_bytes());
         let text = String::from_utf8(result).unwrap();
-        assert!(text.ends_with(body));
+        // ASCII body passes through QP encoding unchanged
+        assert!(text.contains(body));
     }
 
     #[test]
@@ -583,7 +706,123 @@ mod tests {
         // Fresh values present
         assert!(text.contains("Date: "));
         assert!(text.contains("Message-ID: <"));
-        assert!(text.contains("MIME-Version: 1.0"));
+        assert!(text.contains("MIME-Version: 1.0 (Mac OS X Mail 16.0"));
         assert!(text.contains("Body"));
+    }
+
+    #[test]
+    fn inject_headers_message_id_uses_domain() {
+        let msg = b"From: a@example.com\r\nSubject: hi\r\n\r\nBody";
+        let result = inject_missing_headers(msg);
+        let text = String::from_utf8(result).unwrap();
+        let expected_domain = super::DOMAIN.unwrap_or("localhost");
+        let pattern = format!("@{}>", expected_domain);
+        assert!(
+            text.contains(&pattern),
+            "Message-ID should end with @{}>",
+            expected_domain
+        );
+    }
+
+    #[test]
+    fn inject_headers_date_has_local_timezone() {
+        let msg = b"From: a@example.com\r\nSubject: hi\r\n\r\nBody";
+        let result = inject_missing_headers(msg);
+        let text = String::from_utf8(result).unwrap();
+        // Date header should contain a timezone offset like +0100 or -0500
+        let date_line = text
+            .lines()
+            .find(|l| l.starts_with("Date: "))
+            .expect("Date header missing");
+        let trimmed = date_line.trim();
+        // Last 5 chars should be +HHMM or -HHMM
+        let offset = &trimmed[trimmed.len() - 5..];
+        let sign = offset.as_bytes()[0];
+        assert!(
+            sign == b'+' || sign == b'-',
+            "Date should end with timezone offset: {}",
+            date_line
+        );
+        assert!(
+            offset[1..].chars().all(|c| c.is_ascii_digit()),
+            "Date timezone offset should be digits: {}",
+            offset
+        );
+    }
+
+    #[test]
+    fn inject_headers_content_type_preserved_when_present() {
+        let msg = b"From: a@example.com\r\nContent-Type: text/html; charset=iso-8859-1\r\nSubject: hi\r\n\r\n<b>Body</b>";
+        let result = inject_missing_headers(msg);
+        let text = String::from_utf8(result).unwrap();
+        // Original Content-Type preserved
+        assert!(text.contains("Content-Type: text/html; charset=iso-8859-1"));
+        // No extra Content-Type injected
+        assert_eq!(text.matches("Content-Type:").count(), 1);
+    }
+
+    #[test]
+    fn inject_headers_multipart_skips_cte_and_body_encoding() {
+        let msg = b"From: a@example.com\r\nContent-Type: multipart/mixed; boundary=abc\r\nSubject: hi\r\n\r\n--abc\r\nContent-Type: text/plain\r\n\r\nHello\r\n--abc--";
+        let result = inject_missing_headers(msg);
+        let text = String::from_utf8(result).unwrap();
+        // No CTE header for multipart
+        assert!(
+            !text.contains("Content-Transfer-Encoding:"),
+            "Multipart messages should not get CTE header"
+        );
+        // Body preserved as-is
+        assert!(text.contains("--abc\r\nContent-Type: text/plain\r\n\r\nHello\r\n--abc--"));
+    }
+
+    // --- quoted_printable_encode_body tests ---
+
+    #[test]
+    fn qp_encode_ascii_passthrough() {
+        let input = b"Hello, world!";
+        let result = quoted_printable_encode_body(input);
+        assert_eq!(result, b"Hello, world!");
+    }
+
+    #[test]
+    fn qp_encode_equals_sign() {
+        let input = b"a=b";
+        let result = quoted_printable_encode_body(input);
+        assert_eq!(result, b"a=3Db");
+    }
+
+    #[test]
+    fn qp_encode_utf8() {
+        let input = "café".as_bytes(); // é = 0xC3 0xA9
+        let result = quoted_printable_encode_body(input);
+        assert_eq!(result, b"caf=C3=A9");
+    }
+
+    #[test]
+    fn qp_encode_trailing_whitespace() {
+        let input = b"hello \r\n";
+        let result = quoted_printable_encode_body(input);
+        assert_eq!(result, b"hello=20\r\n");
+    }
+
+    #[test]
+    fn qp_encode_long_line_wrapping() {
+        // 80 chars of 'A' should be soft-wrapped
+        let input = "A".repeat(80);
+        let result = quoted_printable_encode_body(input.as_bytes());
+        let text = String::from_utf8(result).unwrap();
+        // Should contain a soft break
+        assert!(text.contains("=\r\n"));
+        // No line should exceed 76 chars (excluding soft break)
+        for line in text.split("\r\n") {
+            if !line.is_empty() {
+                assert!(
+                    line.len() <= 76,
+                    "Line too long ({} chars): {}",
+                    line.len(),
+                    line
+                );
+            }
+        }
     }
 }
