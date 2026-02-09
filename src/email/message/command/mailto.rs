@@ -87,13 +87,15 @@ impl MessageMailtoCommand {
             msg.extend(sig.as_bytes());
         }
 
-        let tpl = account_config
+        let mut tpl: email::message::template::Template = account_config
             .generate_tpl_interpreter()
             .with_show_only_headers(account_config.get_message_write_headers())
             .build()
             .from_bytes(msg)
             .await?
             .into();
+
+        crate::from_override::inject_cc_in_tpl(&mut tpl.content);
 
         editor::edit_tpl_with_editor(account_config, printer, &backend, tpl).await
     }

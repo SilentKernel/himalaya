@@ -71,7 +71,7 @@ impl MessageForwardCommand {
         .await?;
 
         let id = self.envelope.id;
-        let tpl = backend
+        let mut tpl = backend
             .get_messages(folder, &[id])
             .await?
             .first()
@@ -81,6 +81,9 @@ impl MessageForwardCommand {
             .with_body(self.body.raw())
             .build()
             .await?;
+
+        crate::from_override::inject_cc_in_tpl(&mut tpl.content);
+
         editor::edit_tpl_with_editor(account_config, printer, &backend, tpl).await
     }
 }

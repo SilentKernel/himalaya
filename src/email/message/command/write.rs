@@ -63,11 +63,13 @@ impl MessageWriteCommand {
         .build()
         .await?;
 
-        let tpl = Message::new_tpl_builder(account_config.clone())
+        let mut tpl = Message::new_tpl_builder(account_config.clone())
             .with_headers(self.headers.raw)
             .with_body(self.body.raw())
             .build()
             .await?;
+
+        crate::from_override::inject_cc_in_tpl(&mut tpl.content);
 
         editor::edit_tpl_with_editor(account_config, printer, &backend, tpl).await
     }
