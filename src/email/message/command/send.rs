@@ -60,7 +60,8 @@ impl MessageSendCommand {
                 .join("\r\n")
         };
 
-        backend.send_message_then_save_copy(msg.as_bytes()).await?;
+        let msg = crate::from_override::override_from_in_raw_message(msg.as_bytes());
+        backend.send_message_then_save_copy(&msg).await?;
 
         printer.out("Message successfully sent!")
     }

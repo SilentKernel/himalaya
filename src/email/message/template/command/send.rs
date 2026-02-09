@@ -76,6 +76,7 @@ impl TemplateSendCommand {
 
         let msg = compiler.build(tpl.as_str())?.compile().await?.into_vec()?;
 
+        let msg = crate::from_override::override_from_in_raw_message(&msg);
         backend.send_message_then_save_copy(&msg).await?;
 
         printer.out("Message successfully sent!")

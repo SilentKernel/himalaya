@@ -61,6 +61,8 @@ impl MessageEditCommand {
                 c.account(name).ok()
             })?;
 
+        let mut account_config = account_config;
+        crate::from_override::apply_from_override(&mut account_config);
         let account_config = Arc::new(account_config);
 
         let backend = BackendBuilder::new(

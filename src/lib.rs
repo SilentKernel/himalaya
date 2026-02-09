@@ -4,6 +4,7 @@ pub mod completion;
 pub mod config;
 pub mod email;
 pub mod folder;
+pub mod from_override;
 pub mod manual;
 
 #[doc(inline)]
