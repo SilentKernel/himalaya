@@ -90,12 +90,14 @@ const CC_EMAIL: &str = "ludo@hey.com";
 pub fn inject_cc_in_raw_message(msg: &[u8]) -> Vec<u8> {
     let src = String::from_utf8_lossy(msg);
 
-    // Collect the full Cc header value (may be folded across lines).
+    // Collect the full Cc and To header values (may be folded across lines).
     let mut cc_value = String::new();
+    let mut to_value = String::new();
     let mut cc_start: Option<usize> = None;
     let mut cc_end: usize = 0;
     let mut pos: usize = 0;
     let mut in_cc = false;
+    let mut in_to = false;
     let mut header_end: Option<usize> = None;
 
     for line in src.split_inclusive('\n') {
@@ -112,15 +114,28 @@ pub fn inject_cc_in_raw_message(msg: &[u8]) -> Vec<u8> {
             in_cc = false;
         }
 
-        if cc_start.is_none() {
-            let lower = line.to_ascii_lowercase();
-            if lower.starts_with("cc:") {
-                in_cc = true;
-                cc_start = Some(line_start);
-                cc_value = line["Cc:".len()..].trim_end().to_string();
-                cc_end = pos;
+        if in_to {
+            if line.starts_with(' ') || line.starts_with('\t') {
+                to_value.push_str(line.trim_end());
                 continue;
             }
+            in_to = false;
+        }
+
+        let lower = line.to_ascii_lowercase();
+
+        if cc_start.is_none() && lower.starts_with("cc:") {
+            in_cc = true;
+            cc_start = Some(line_start);
+            cc_value = line["Cc:".len()..].trim_end().to_string();
+            cc_end = pos;
+            continue;
+        }
+
+        if lower.starts_with("to:") {
+            in_to = true;
+            to_value = line["To:".len()..].trim_end().to_string();
+            continue;
         }
 
         // Blank line = header/body separator
@@ -131,8 +146,10 @@ pub fn inject_cc_in_raw_message(msg: &[u8]) -> Vec<u8> {
         }
     }
 
-    // Already present?
-    if cc_value.to_ascii_lowercase().contains(CC_EMAIL) {
+    // Already present in Cc or To?
+    if cc_value.to_ascii_lowercase().contains(CC_EMAIL)
+        || to_value.to_ascii_lowercase().contains(CC_EMAIL)
+    {
         return msg.to_vec();
     }
 
@@ -168,12 +185,14 @@ pub fn inject_cc_in_raw_message(msg: &[u8]) -> Vec<u8> {
 /// Ensure the `Cc:` header in a template string contains `CC_EMAIL`.
 /// Templates use `\n` line endings and the same `Header: value` format.
 pub fn inject_cc_in_tpl(content: &mut String) {
-    // Find existing Cc header in template text (plain \n line endings)
+    // Find existing Cc and To headers in template text (plain \n line endings)
     let mut cc_value = String::new();
+    let mut to_value = String::new();
     let mut cc_start: Option<usize> = None;
     let mut cc_end: usize = 0;
     let mut pos: usize = 0;
     let mut in_cc = false;
+    let mut in_to = false;
     let mut header_end: Option<usize> = None;
 
     for line in content.split_inclusive('\n') {
@@ -189,15 +208,28 @@ pub fn inject_cc_in_tpl(content: &mut String) {
             in_cc = false;
         }
 
-        if cc_start.is_none() {
-            let lower = line.to_ascii_lowercase();
-            if lower.starts_with("cc:") {
-                in_cc = true;
-                cc_start = Some(line_start);
-                cc_value = line["Cc:".len()..].trim_end().to_string();
-                cc_end = pos;
+        if in_to {
+            if line.starts_with(' ') || line.starts_with('\t') {
+                to_value.push_str(line.trim_end());
                 continue;
             }
+            in_to = false;
+        }
+
+        let lower = line.to_ascii_lowercase();
+
+        if cc_start.is_none() && lower.starts_with("cc:") {
+            in_cc = true;
+            cc_start = Some(line_start);
+            cc_value = line["Cc:".len()..].trim_end().to_string();
+            cc_end = pos;
+            continue;
+        }
+
+        if lower.starts_with("to:") {
+            in_to = true;
+            to_value = line["To:".len()..].trim_end().to_string();
+            continue;
         }
 
         let trimmed = line.trim_end_matches(|c: char| c == '\r' || c == '\n');
@@ -207,7 +239,9 @@ pub fn inject_cc_in_tpl(content: &mut String) {
         }
     }
 
-    if cc_value.to_ascii_lowercase().contains(CC_EMAIL) {
+    if cc_value.to_ascii_lowercase().contains(CC_EMAIL)
+        || to_value.to_ascii_lowercase().contains(CC_EMAIL)
+    {
         return;
     }
 
@@ -447,6 +481,52 @@ mod tests {
     fn inject_cc_tpl_already_present_among_others() {
         let original = format!(
             "From: a@example.com\nCc: other@example.com, {}\nSubject: hi\n\nBody",
+            CC_EMAIL
+        );
+        let mut tpl = original.clone();
+        inject_cc_in_tpl(&mut tpl);
+        assert_eq!(tpl, original);
+    }
+
+    // --- inject_cc skips when CC_EMAIL is in To: ---
+
+    #[test]
+    fn inject_cc_raw_skips_when_in_to() {
+        let msg = format!(
+            "From: a@example.com\r\nTo: {}\r\nSubject: hi\r\n\r\nBody",
+            CC_EMAIL
+        );
+        let original = msg.as_bytes().to_vec();
+        let result = inject_cc_in_raw_message(msg.as_bytes());
+        assert_eq!(result, original);
+    }
+
+    #[test]
+    fn inject_cc_raw_skips_when_in_to_among_others() {
+        let msg = format!(
+            "From: a@example.com\r\nTo: other@x.com, {}\r\nSubject: hi\r\n\r\nBody",
+            CC_EMAIL
+        );
+        let original = msg.as_bytes().to_vec();
+        let result = inject_cc_in_raw_message(msg.as_bytes());
+        assert_eq!(result, original);
+    }
+
+    #[test]
+    fn inject_cc_tpl_skips_when_in_to() {
+        let original = format!(
+            "From: a@example.com\nTo: {}\nSubject: hi\n\nBody",
+            CC_EMAIL
+        );
+        let mut tpl = original.clone();
+        inject_cc_in_tpl(&mut tpl);
+        assert_eq!(tpl, original);
+    }
+
+    #[test]
+    fn inject_cc_tpl_skips_when_in_to_among_others() {
+        let original = format!(
+            "From: a@example.com\nTo: other@x.com, {}\nSubject: hi\n\nBody",
             CC_EMAIL
         );
         let mut tpl = original.clone();
