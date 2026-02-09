@@ -225,6 +225,76 @@ pub fn inject_cc_in_tpl(content: &mut String) {
     }
 }
 
+/// Always inject fresh `Date:`, `Message-ID:`, and `MIME-Version:` headers
+/// into a raw RFC 5322 message. If any of these headers already exist, they
+/// are removed and replaced with fresh values. New headers are inserted
+/// just before the header/body separator (the first blank line).
+pub fn inject_missing_headers(msg: &[u8]) -> Vec<u8> {
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    let src = String::from_utf8_lossy(msg);
+
+    // Names of headers we want to replace (lowercase for comparison).
+    const TARGETS: &[&str] = &["date:", "message-id:", "mime-version:"];
+
+    // Collect non-target header lines + track where the body starts.
+    let mut header_lines: Vec<&str> = Vec::new();
+    let mut lines = src.split_inclusive('\n');
+    let mut body_start: Option<usize> = None;
+    let mut pos: usize = 0;
+    let mut skip_folded = false;
+
+    for line in lines.by_ref() {
+        let line_start = pos;
+        pos += line.len();
+
+        // Check for header/body separator (blank line).
+        let trimmed = line.trim_end_matches(|c| c == '\r' || c == '\n');
+        if trimmed.is_empty() {
+            body_start = Some(line_start);
+            break;
+        }
+
+        if skip_folded {
+            if line.starts_with(' ') || line.starts_with('\t') {
+                // Folded continuation of a target header — skip it.
+                continue;
+            }
+            skip_folded = false;
+        }
+
+        let lower = line.to_ascii_lowercase();
+        if TARGETS.iter().any(|t| lower.starts_with(t)) {
+            skip_folded = true;
+            continue;
+        }
+
+        header_lines.push(line);
+    }
+
+    // Build replacement headers.
+    let date = Utc::now().format("%a, %d %b %Y %H:%M:%S %z");
+    let msg_id = format!("<{}@localhost>", Uuid::new_v4());
+
+    let mut result = String::with_capacity(src.len() + 128);
+
+    for line in &header_lines {
+        result.push_str(line);
+    }
+
+    result.push_str(&format!("Date: {}\r\n", date));
+    result.push_str(&format!("Message-ID: {}\r\n", msg_id));
+    result.push_str("MIME-Version: 1.0\r\n");
+
+    // Re-append the blank separator and body.
+    if let Some(sep) = body_start {
+        result.push_str(&src[sep..]);
+    }
+
+    result.into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,5 +452,58 @@ mod tests {
         let mut tpl = original.clone();
         inject_cc_in_tpl(&mut tpl);
         assert_eq!(tpl, original);
+    }
+
+    // --- inject_missing_headers tests ---
+
+    #[test]
+    fn inject_headers_adds_all_when_missing() {
+        let msg = b"From: a@example.com\r\nSubject: hi\r\n\r\nBody text";
+        let result = inject_missing_headers(msg);
+        let text = String::from_utf8(result).unwrap();
+        assert!(text.contains("Date: "));
+        assert!(text.contains("Message-ID: <"));
+        assert!(text.contains("MIME-Version: 1.0"));
+        // Original headers preserved
+        assert!(text.contains("From: a@example.com"));
+        assert!(text.contains("Subject: hi"));
+    }
+
+    #[test]
+    fn inject_headers_replaces_existing() {
+        let msg = b"From: a@example.com\r\nDate: Thu, 01 Jan 1970 00:00:00 +0000\r\nMessage-ID: <old@old>\r\nMIME-Version: 1.0\r\nSubject: hi\r\n\r\nBody";
+        let result = inject_missing_headers(msg);
+        let text = String::from_utf8(result).unwrap();
+        // Old values should be gone
+        assert!(!text.contains("Thu, 01 Jan 1970"));
+        assert!(!text.contains("<old@old>"));
+        // Fresh values should be present
+        assert!(text.contains("Date: "));
+        assert!(text.contains("Message-ID: <"));
+        assert!(text.contains("MIME-Version: 1.0"));
+    }
+
+    #[test]
+    fn inject_headers_preserves_body() {
+        let body = "This is the body\r\nwith multiple lines\r\nand stuff.";
+        let msg = format!("From: a@example.com\r\nSubject: hi\r\n\r\n{}", body);
+        let result = inject_missing_headers(msg.as_bytes());
+        let text = String::from_utf8(result).unwrap();
+        assert!(text.ends_with(body));
+    }
+
+    #[test]
+    fn inject_headers_handles_folded() {
+        let msg = b"From: a@example.com\r\nDate: Thu,\r\n 01 Jan 1970 00:00:00 +0000\r\nMessage-ID:\r\n <old@old>\r\nSubject: hi\r\n\r\nBody";
+        let result = inject_missing_headers(msg);
+        let text = String::from_utf8(result).unwrap();
+        // Folded old values should be fully removed
+        assert!(!text.contains("01 Jan 1970"));
+        assert!(!text.contains("<old@old>"));
+        // Fresh values present
+        assert!(text.contains("Date: "));
+        assert!(text.contains("Message-ID: <"));
+        assert!(text.contains("MIME-Version: 1.0"));
+        assert!(text.contains("Body"));
     }
 }
