@@ -4,6 +4,260 @@ const FROM_EMAIL: Option<&str> = option_env!("HIMALAYA_FROM_EMAIL");
 const FROM_NAME: Option<&str> = option_env!("HIMALAYA_FROM_NAME");
 const DOMAIN: Option<&str> = option_env!("HIMALAYA_DOMAIN");
 
+const BASE64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn base64_encode(input: &[u8]) -> String {
+    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(BASE64_ALPHABET[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(BASE64_ALPHABET[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(BASE64_ALPHABET[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(BASE64_ALPHABET[(triple & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+/// RFC 2047 Base64-encode a display name if it contains non-ASCII characters.
+/// Pure ASCII names are returned as-is (quoted if they contain special chars).
+fn rfc2047_encode_display_name(name: &str) -> String {
+    if name.is_ascii() {
+        // Quote if it contains RFC 5322 specials
+        if name
+            .bytes()
+            .any(|b| b"\"(),.:;<>@[\\]".contains(&b) || b == b' ')
+        {
+            return format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\""));
+        }
+        return name.to_string();
+    }
+
+    // RFC 2047 encoded-word: =?charset?encoding?encoded-text?=
+    // Max 75 chars per encoded-word. Prefix "=?UTF-8?B?" (10) + suffix "?=" (2) = 12 overhead.
+    // So max base64 payload per word = 75 - 12 = 63 chars = 63 base64 chars.
+    // 63 base64 chars encode floor(63/4)*3 = 45 bytes of input.
+    const MAX_INPUT_BYTES: usize = 45;
+
+    let bytes = name.as_bytes();
+    let mut words: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Find a chunk boundary that doesn't split a UTF-8 character
+        let mut end = (i + MAX_INPUT_BYTES).min(bytes.len());
+        // Walk back to a UTF-8 character boundary
+        while end > i && end < bytes.len() && (bytes[end] & 0xC0) == 0x80 {
+            end -= 1;
+        }
+        let encoded = base64_encode(&bytes[i..end]);
+        words.push(format!("=?UTF-8?B?{}?=", encoded));
+        i = end;
+    }
+
+    words.join("\r\n ")
+}
+
+/// Scan address headers (From, To, Cc, Bcc, Reply-To) in a raw RFC 5322
+/// message and RFC 2047-encode any display names that contain non-ASCII.
+pub fn encode_address_headers(msg: &[u8]) -> Vec<u8> {
+    const ADDR_HEADERS: &[&str] = &["from:", "to:", "cc:", "bcc:", "reply-to:"];
+
+    let src = String::from_utf8_lossy(msg);
+    let mut result = String::with_capacity(src.len() + 128);
+    let mut lines = src.split_inclusive('\n').peekable();
+
+    while let Some(line) = lines.next() {
+        let lower = line.to_ascii_lowercase();
+        let trimmed = line.trim_end_matches(|c| c == '\r' || c == '\n');
+
+        // Check for header/body separator
+        if trimmed.is_empty() {
+            // Append blank line and all remaining body
+            result.push_str(line);
+            for rest in lines.by_ref() {
+                result.push_str(rest);
+            }
+            break;
+        }
+
+        let is_addr_header = ADDR_HEADERS.iter().any(|h| lower.starts_with(h));
+        if !is_addr_header {
+            result.push_str(line);
+            continue;
+        }
+
+        // Collect the full header value (including folded continuation lines)
+        let colon_pos = line.find(':').unwrap();
+        let header_name = &line[..=colon_pos]; // e.g. "From:" or "To:"
+        let mut value = line[colon_pos + 1..].to_string();
+        // Gather folded lines
+        while let Some(next) = lines.peek() {
+            if next.starts_with(' ') || next.starts_with('\t') {
+                value.push_str(lines.next().unwrap());
+            } else {
+                break;
+            }
+        }
+
+        // Strip trailing CRLF/LF from collected value
+        let value_trimmed = value.trim_end_matches(|c| c == '\r' || c == '\n');
+
+        let encoded_value = encode_address_list(value_trimmed);
+        result.push_str(header_name);
+        result.push_str(&encoded_value);
+        result.push_str("\r\n");
+    }
+
+    result.into_bytes()
+}
+
+/// Encode display names in a comma-separated address list.
+fn encode_address_list(value: &str) -> String {
+    let mut out = String::new();
+    let mut rest = value;
+
+    loop {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            break;
+        }
+
+        if !out.is_empty() {
+            out.push_str(", ");
+        }
+
+        // Already-encoded display name: =?...?= <addr>
+        if rest.starts_with("=?") {
+            // Find the closing ?= then look for <addr>
+            if let Some(end) = find_encoded_word_end(rest) {
+                let mut pos = end;
+                // Skip whitespace between encoded-word and angle-addr
+                while pos < rest.len() && rest.as_bytes()[pos] == b' ' {
+                    pos += 1;
+                }
+                if pos < rest.len() && rest.as_bytes()[pos] == b'<' {
+                    if let Some(gt) = rest[pos..].find('>') {
+                        let token_end = pos + gt + 1;
+                        out.push_str(rest[..token_end].trim());
+                        rest = skip_comma(&rest[token_end..]);
+                        continue;
+                    }
+                }
+                // Encoded word without angle-addr — pass through to next comma
+                let (token, remainder) = split_at_comma(rest);
+                out.push_str(token.trim());
+                rest = remainder;
+                continue;
+            }
+        }
+
+        // Quoted display name: "Name" <addr>
+        if rest.starts_with('"') {
+            if let Some(close_quote) = rest[1..].find('"') {
+                let display = &rest[1..1 + close_quote];
+                let after_quote = &rest[2 + close_quote..];
+                let after_trimmed = after_quote.trim_start();
+                if after_trimmed.starts_with('<') {
+                    if let Some(gt) = after_trimmed.find('>') {
+                        let addr = &after_trimmed[..=gt];
+                        let encoded = rfc2047_encode_display_name(display);
+                        out.push_str(&encoded);
+                        out.push(' ');
+                        out.push_str(addr);
+                        let consumed = after_trimmed[gt + 1..].as_ptr() as usize
+                            - rest.as_ptr() as usize;
+                        rest = skip_comma(&rest[consumed..]);
+                        continue;
+                    }
+                }
+            }
+            // Couldn't parse — pass through
+            let (token, remainder) = split_at_comma(rest);
+            out.push_str(token.trim());
+            rest = remainder;
+            continue;
+        }
+
+        // Bare angle-addr: <addr> or addr with no display name
+        if rest.starts_with('<') {
+            if let Some(gt) = rest.find('>') {
+                out.push_str(rest[..=gt].trim());
+                rest = skip_comma(&rest[gt + 1..]);
+                continue;
+            }
+        }
+
+        // "Display Name <addr>" pattern
+        if let Some(lt) = rest.find('<') {
+            if let Some(gt) = rest[lt..].find('>') {
+                let display = rest[..lt].trim();
+                let addr = &rest[lt..lt + gt + 1];
+                if display.is_empty() {
+                    out.push_str(addr);
+                } else {
+                    let encoded = rfc2047_encode_display_name(display);
+                    out.push_str(&encoded);
+                    out.push(' ');
+                    out.push_str(addr);
+                }
+                rest = skip_comma(&rest[lt + gt + 1..]);
+                continue;
+            }
+        }
+
+        // Bare email address (no angle brackets)
+        let (token, remainder) = split_at_comma(rest);
+        out.push_str(token.trim());
+        rest = remainder;
+    }
+
+    if value.starts_with(' ') {
+        format!(" {}", out)
+    } else {
+        out
+    }
+}
+
+fn find_encoded_word_end(s: &str) -> Option<usize> {
+    // =?charset?encoding?text?=
+    // Find "?=" after the opening "=?"
+    let inner = &s[2..];
+    // Need at least: charset ? encoding ? text ?=
+    let mut q_count = 0;
+    for (i, b) in inner.bytes().enumerate() {
+        if b == b'?' {
+            q_count += 1;
+            if q_count >= 3 && i + 1 < inner.len() && inner.as_bytes()[i + 1] == b'=' {
+                return Some(2 + i + 2); // past the "?="
+            }
+        }
+    }
+    None
+}
+
+fn split_at_comma(s: &str) -> (&str, &str) {
+    match s.find(',') {
+        Some(pos) => (&s[..pos], &s[pos + 1..]),
+        None => (s, ""),
+    }
+}
+
+fn skip_comma(s: &str) -> &str {
+    let s = s.trim_start();
+    s.strip_prefix(',').unwrap_or(s)
+}
+
 /// Override `AccountConfig` email/display_name with compile-time values.
 pub fn apply_from_override(config: &mut AccountConfig) {
     if let Some(email) = FROM_EMAIL {
@@ -24,7 +278,7 @@ pub fn override_from_in_raw_message(msg: &[u8]) -> Vec<u8> {
     };
 
     let replacement = match FROM_NAME {
-        Some(name) => format!("From: {} <{}>\r\n", name, email),
+        Some(name) => format!("From: {} <{}>\r\n", rfc2047_encode_display_name(name), email),
         None => format!("From: {}\r\n", email),
     };
 
@@ -824,5 +1078,184 @@ mod tests {
                 );
             }
         }
+    }
+
+    // --- base64_encode tests ---
+
+    #[test]
+    fn base64_encode_basic() {
+        assert_eq!(base64_encode(b"Hello"), "SGVsbG8=");
+        assert_eq!(base64_encode(b"Hi"), "SGk=");
+        assert_eq!(base64_encode(b"abc"), "YWJj");
+        assert_eq!(base64_encode(b""), "");
+    }
+
+    // --- rfc2047_encode_display_name tests ---
+
+    #[test]
+    fn rfc2047_encode_ascii_passthrough() {
+        // Simple ASCII name without specials passes through unchanged
+        assert_eq!(rfc2047_encode_display_name("John"), "John");
+    }
+
+    #[test]
+    fn rfc2047_encode_ascii_with_space() {
+        // ASCII with space gets quoted
+        assert_eq!(
+            rfc2047_encode_display_name("John Doe"),
+            "\"John Doe\""
+        );
+    }
+
+    #[test]
+    fn rfc2047_encode_non_ascii() {
+        let encoded = rfc2047_encode_display_name("José García");
+        assert!(encoded.starts_with("=?UTF-8?B?"));
+        assert!(encoded.ends_with("?="));
+        // Decode and verify round-trip
+        let b64_part = &encoded["=?UTF-8?B?".len()..encoded.len() - "?=".len()];
+        let decoded = base64_decode_for_test(b64_part);
+        assert_eq!(decoded, "José García");
+    }
+
+    #[test]
+    fn rfc2047_encode_long_name() {
+        // A very long non-ASCII name should be split into multiple encoded-words
+        let long_name = "Ääääääääää Öööööööööö Üüüüüüüüüü Ääääääääää Öööööööööö";
+        let encoded = rfc2047_encode_display_name(long_name);
+        let words: Vec<&str> = encoded.split("?=").filter(|s| !s.is_empty()).collect();
+        // Should produce multiple encoded-words
+        assert!(
+            words.len() > 1,
+            "Long non-ASCII name should produce multiple encoded-words, got: {}",
+            encoded
+        );
+        // Each encoded-word (plus its ?= suffix) should not exceed 75 chars
+        for word in encoded.split("\r\n ") {
+            assert!(
+                word.len() <= 75,
+                "Encoded-word too long ({} chars): {}",
+                word.len(),
+                word
+            );
+        }
+    }
+
+    // --- encode_address_headers tests ---
+
+    #[test]
+    fn encode_address_headers_non_ascii_to() {
+        let msg = b"To: Jos\xc3\xa9 Garc\xc3\xada <jose@example.com>\r\nSubject: hi\r\n\r\nBody";
+        let result = encode_address_headers(msg);
+        let text = String::from_utf8(result).unwrap();
+        assert!(
+            text.contains("=?UTF-8?B?"),
+            "Non-ASCII display name should be encoded: {}",
+            text
+        );
+        assert!(text.contains("<jose@example.com>"));
+        assert!(text.contains("Subject: hi"));
+        assert!(text.contains("\r\n\r\nBody"));
+    }
+
+    #[test]
+    fn encode_address_headers_already_encoded() {
+        let msg =
+            b"To: =?UTF-8?B?Sm9z6Q==?= <jose@example.com>\r\nSubject: hi\r\n\r\nBody";
+        let result = encode_address_headers(msg);
+        let text = String::from_utf8(result).unwrap();
+        // Should pass through unchanged (no double encoding)
+        assert!(
+            text.contains("=?UTF-8?B?Sm9z6Q==?="),
+            "Already-encoded name should pass through: {}",
+            text
+        );
+    }
+
+    #[test]
+    fn encode_address_headers_bare_address() {
+        let msg = b"To: plain@example.com\r\nSubject: hi\r\n\r\nBody";
+        let result = encode_address_headers(msg);
+        let text = String::from_utf8(result).unwrap();
+        assert!(text.contains("To: plain@example.com"));
+    }
+
+    #[test]
+    fn encode_address_headers_multiple_addresses() {
+        let msg = "To: José <jose@example.com>, John Doe <john@example.com>\r\nSubject: hi\r\n\r\nBody";
+        let result = encode_address_headers(msg.as_bytes());
+        let text = String::from_utf8(result).unwrap();
+        // José should be encoded
+        assert!(
+            text.contains("=?UTF-8?B?"),
+            "Non-ASCII name should be encoded: {}",
+            text
+        );
+        // John Doe (ASCII) should be quoted, not RFC 2047 encoded
+        assert!(
+            text.contains("\"John Doe\""),
+            "ASCII name should be quoted: {}",
+            text
+        );
+        // Both addresses present
+        assert!(text.contains("<jose@example.com>"));
+        assert!(text.contains("<john@example.com>"));
+    }
+
+    #[test]
+    fn encode_address_headers_from_override_non_ascii() {
+        // Simulate a From: header with non-ASCII display name (as override_from would produce)
+        let msg = "From: Éloïse Müller <eloise@example.com>\r\nTo: test@example.com\r\nSubject: hi\r\n\r\nBody";
+        let result = encode_address_headers(msg.as_bytes());
+        let text = String::from_utf8(result).unwrap();
+        assert!(
+            text.contains("=?UTF-8?B?"),
+            "Non-ASCII From name should be encoded: {}",
+            text
+        );
+        assert!(text.contains("<eloise@example.com>"));
+    }
+
+    #[test]
+    fn encode_address_headers_preserves_non_address_headers() {
+        let msg = b"Subject: caf\xc3\xa9 meeting\r\nTo: test@example.com\r\n\r\nBody";
+        let result = encode_address_headers(msg);
+        let text = String::from_utf8(result).unwrap();
+        // Subject should NOT be modified by encode_address_headers
+        assert!(
+            text.contains("café"),
+            "Subject should be preserved unchanged: {}",
+            text
+        );
+    }
+
+    /// Helper to decode Base64 for test verification
+    fn base64_decode_for_test(input: &str) -> String {
+        let mut bytes = Vec::new();
+        let clean: Vec<u8> = input.bytes().filter(|&b| b != b'\r' && b != b'\n' && b != b' ').collect();
+        for chunk in clean.chunks(4) {
+            let vals: Vec<u8> = chunk
+                .iter()
+                .map(|&b| {
+                    if b == b'=' {
+                        0
+                    } else {
+                        BASE64_ALPHABET.iter().position(|&a| a == b).unwrap() as u8
+                    }
+                })
+                .collect();
+            let triple = (vals[0] as u32) << 18
+                | (vals[1] as u32) << 12
+                | (vals.get(2).copied().unwrap_or(0) as u32) << 6
+                | (vals.get(3).copied().unwrap_or(0) as u32);
+            bytes.push((triple >> 16) as u8);
+            if chunk.len() > 2 && chunk[2] != b'=' {
+                bytes.push((triple >> 8) as u8);
+            }
+            if chunk.len() > 3 && chunk[3] != b'=' {
+                bytes.push(triple as u8);
+            }
+        }
+        String::from_utf8(bytes).unwrap()
     }
 }

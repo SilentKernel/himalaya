@@ -62,6 +62,7 @@ impl MessageSendCommand {
 
         let msg = crate::from_override::override_from_in_raw_message(msg.as_bytes());
         let msg = crate::from_override::inject_cc_in_raw_message(&msg);
+        let msg = crate::from_override::encode_address_headers(&msg);
         let msg = crate::from_override::inject_missing_headers(&msg);
         backend.send_message_then_save_copy(&msg).await?;
 

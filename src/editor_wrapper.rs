@@ -72,6 +72,7 @@ pub async fn edit_tpl_with_editor<P: Printer>(
 
                 let email = crate::from_override::override_from_in_raw_message(&email);
                 let email = crate::from_override::inject_cc_in_raw_message(&email);
+                let email = crate::from_override::encode_address_headers(&email);
                 let email = crate::from_override::inject_missing_headers(&email);
 
                 backend.send_message_then_save_copy(&email).await?;
