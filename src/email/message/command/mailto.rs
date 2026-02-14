@@ -95,6 +95,7 @@ impl MessageMailtoCommand {
             .await?
             .into();
 
+        crate::from_override::strip_excluded_recipients_in_tpl(&mut tpl.content);
         crate::from_override::inject_cc_in_tpl(&mut tpl.content);
 
         crate::editor_wrapper::edit_tpl_with_editor(account_config, printer, &backend, tpl).await

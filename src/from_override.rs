@@ -337,7 +337,161 @@ pub fn override_from_in_raw_message(msg: &[u8]) -> Vec<u8> {
     result.into_bytes()
 }
 
+const EXCLUDED_RECIPIENTS: &[&str] = &[
+    "ludo@viteunetable.com",
+];
+
 const CC_EMAIL: &str = "ludo@hey.com";
+
+/// Extract the email address portion from an address token like
+/// `Display Name <addr@example.com>` or bare `addr@example.com`.
+fn extract_email(token: &str) -> &str {
+    let t = token.trim();
+    if let Some(lt) = t.find('<') {
+        if let Some(gt) = t[lt..].find('>') {
+            return &t[lt + 1..lt + gt];
+        }
+    }
+    t
+}
+
+/// Return true if `token` contains any of the excluded email addresses.
+fn is_excluded(token: &str) -> bool {
+    let email = extract_email(token).trim();
+    EXCLUDED_RECIPIENTS
+        .iter()
+        .any(|excl| email.eq_ignore_ascii_case(excl))
+}
+
+/// Strip excluded recipients from To, Cc, and Bcc headers in a raw
+/// RFC 5322 message (`\r\n` line endings). If a header becomes empty
+/// after removal, the entire header line is removed.
+pub fn strip_excluded_recipients_in_raw_message(msg: &[u8]) -> Vec<u8> {
+    const ADDR_HEADERS: &[&str] = &["to:", "cc:", "bcc:"];
+
+    let src = String::from_utf8_lossy(msg);
+    let mut result = String::with_capacity(src.len());
+    let mut lines = src.split_inclusive('\n').peekable();
+
+    while let Some(line) = lines.next() {
+        let trimmed = line.trim_end_matches(|c| c == '\r' || c == '\n');
+
+        // Header/body separator — copy rest as-is
+        if trimmed.is_empty() {
+            result.push_str(line);
+            for rest in lines.by_ref() {
+                result.push_str(rest);
+            }
+            break;
+        }
+
+        let lower = line.to_ascii_lowercase();
+        let is_addr_header = ADDR_HEADERS.iter().any(|h| lower.starts_with(h));
+        if !is_addr_header {
+            result.push_str(line);
+            continue;
+        }
+
+        // Collect full header value (including folded continuation lines)
+        let colon_pos = line.find(':').unwrap();
+        let header_name = &line[..=colon_pos];
+        let mut value = line[colon_pos + 1..].to_string();
+        while let Some(next) = lines.peek() {
+            if next.starts_with(' ') || next.starts_with('\t') {
+                value.push_str(lines.next().unwrap());
+            } else {
+                break;
+            }
+        }
+
+        let value_trimmed = value.trim_end_matches(|c| c == '\r' || c == '\n');
+
+        // Split into individual address tokens, filter out excluded ones
+        let addrs: Vec<&str> = value_trimmed
+            .split(',')
+            .map(|a| a.trim())
+            .filter(|a| !a.is_empty())
+            .filter(|a| !is_excluded(a))
+            .collect();
+
+        if addrs.is_empty() {
+            // Header is now empty — remove it entirely
+            continue;
+        }
+
+        let leading_space = if value_trimmed.starts_with(' ') {
+            " "
+        } else {
+            " "
+        };
+        result.push_str(header_name);
+        result.push_str(leading_space);
+        result.push_str(&addrs.join(", "));
+        result.push_str("\r\n");
+    }
+
+    result.into_bytes()
+}
+
+/// Strip excluded recipients from To, Cc, and Bcc headers in a
+/// template string (`\n` line endings).
+pub fn strip_excluded_recipients_in_tpl(content: &mut String) {
+    const ADDR_HEADERS: &[&str] = &["to:", "cc:", "bcc:"];
+
+    let src = content.clone();
+    let mut result = String::with_capacity(src.len());
+    let mut lines = src.split_inclusive('\n').peekable();
+
+    while let Some(line) = lines.next() {
+        let trimmed = line.trim_end_matches(|c: char| c == '\r' || c == '\n');
+
+        if trimmed.is_empty() {
+            result.push_str(line);
+            for rest in lines.by_ref() {
+                result.push_str(rest);
+            }
+            break;
+        }
+
+        let lower = line.to_ascii_lowercase();
+        let is_addr_header = ADDR_HEADERS.iter().any(|h| lower.starts_with(h));
+        if !is_addr_header {
+            result.push_str(line);
+            continue;
+        }
+
+        let colon_pos = line.find(':').unwrap();
+        let header_name = &line[..=colon_pos];
+        let mut value = line[colon_pos + 1..].to_string();
+        while let Some(next) = lines.peek() {
+            if next.starts_with(' ') || next.starts_with('\t') {
+                value.push_str(lines.next().unwrap());
+            } else {
+                break;
+            }
+        }
+
+        let value_trimmed = value.trim_end_matches(|c: char| c == '\r' || c == '\n');
+
+        let addrs: Vec<&str> = value_trimmed
+            .split(',')
+            .map(|a| a.trim())
+            .filter(|a| !a.is_empty())
+            .filter(|a| !is_excluded(a))
+            .collect();
+
+        if addrs.is_empty() {
+            continue;
+        }
+
+        result.push_str(header_name);
+        result.push(' ');
+        result.push_str(&addrs.join(", "));
+        result.push('\n');
+    }
+
+    *content = result;
+}
 
 /// Ensure the `Cc:` header in a raw RFC 5322 message contains
 /// `CC_EMAIL`. If the header is missing, one is inserted. If it
@@ -1227,6 +1381,108 @@ mod tests {
             "Subject should be preserved unchanged: {}",
             text
         );
+    }
+
+    // --- strip_excluded_recipients_in_raw_message tests ---
+
+    #[test]
+    fn strip_recipient_raw_from_to() {
+        let msg = b"From: a@example.com\r\nTo: ludo@viteunetable.com\r\nSubject: hi\r\n\r\nBody";
+        let result = strip_excluded_recipients_in_raw_message(msg);
+        let text = String::from_utf8(result).unwrap();
+        assert!(!text.contains("ludo@viteunetable.com"));
+        assert!(!text.contains("To:"));
+    }
+
+    #[test]
+    fn strip_recipient_raw_from_cc() {
+        let msg = b"From: a@example.com\r\nCc: ludo@viteunetable.com\r\nSubject: hi\r\n\r\nBody";
+        let result = strip_excluded_recipients_in_raw_message(msg);
+        let text = String::from_utf8(result).unwrap();
+        assert!(!text.contains("ludo@viteunetable.com"));
+        assert!(!text.contains("Cc:"));
+    }
+
+    #[test]
+    fn strip_recipient_raw_from_bcc() {
+        let msg = b"From: a@example.com\r\nBcc: ludo@viteunetable.com\r\nSubject: hi\r\n\r\nBody";
+        let result = strip_excluded_recipients_in_raw_message(msg);
+        let text = String::from_utf8(result).unwrap();
+        assert!(!text.contains("ludo@viteunetable.com"));
+        assert!(!text.contains("Bcc:"));
+    }
+
+    #[test]
+    fn strip_recipient_raw_among_others() {
+        let msg = b"From: a@example.com\r\nTo: bob@example.com, ludo@viteunetable.com, alice@example.com\r\nSubject: hi\r\n\r\nBody";
+        let result = strip_excluded_recipients_in_raw_message(msg);
+        let text = String::from_utf8(result).unwrap();
+        assert!(!text.contains("ludo@viteunetable.com"));
+        assert!(text.contains("bob@example.com"));
+        assert!(text.contains("alice@example.com"));
+        assert!(text.contains("To:"));
+    }
+
+    #[test]
+    fn strip_recipient_raw_not_present() {
+        let msg = b"From: a@example.com\r\nTo: bob@example.com\r\nSubject: hi\r\n\r\nBody";
+        let result = strip_excluded_recipients_in_raw_message(msg);
+        assert_eq!(result, msg.to_vec());
+    }
+
+    #[test]
+    fn strip_recipient_raw_empty_header_removed() {
+        let msg = b"From: a@example.com\r\nTo: ludo@viteunetable.com\r\nCc: bob@example.com\r\nSubject: hi\r\n\r\nBody";
+        let result = strip_excluded_recipients_in_raw_message(msg);
+        let text = String::from_utf8(result).unwrap();
+        assert!(!text.contains("To:"));
+        assert!(text.contains("Cc: bob@example.com"));
+        assert!(text.contains("Subject: hi"));
+        assert!(text.contains("\r\n\r\nBody"));
+    }
+
+    #[test]
+    fn strip_recipient_raw_with_display_name() {
+        let msg = b"From: a@example.com\r\nTo: Ludo <ludo@viteunetable.com>, bob@example.com\r\n\r\nBody";
+        let result = strip_excluded_recipients_in_raw_message(msg);
+        let text = String::from_utf8(result).unwrap();
+        assert!(!text.contains("viteunetable"));
+        assert!(text.contains("bob@example.com"));
+    }
+
+    #[test]
+    fn strip_recipient_raw_case_insensitive() {
+        let msg = b"From: a@example.com\r\nTo: Ludo@ViteUneTable.COM\r\n\r\nBody";
+        let result = strip_excluded_recipients_in_raw_message(msg);
+        let text = String::from_utf8(result).unwrap();
+        assert!(!text.contains("To:"));
+    }
+
+    // --- strip_excluded_recipients_in_tpl tests ---
+
+    #[test]
+    fn strip_recipient_tpl_from_to() {
+        let mut tpl = "From: a@example.com\nTo: ludo@viteunetable.com\nSubject: hi\n\nBody".to_string();
+        strip_excluded_recipients_in_tpl(&mut tpl);
+        assert!(!tpl.contains("ludo@viteunetable.com"));
+        assert!(!tpl.contains("To:"));
+    }
+
+    #[test]
+    fn strip_recipient_tpl_among_others() {
+        let mut tpl = "From: a@example.com\nTo: bob@example.com, ludo@viteunetable.com, alice@example.com\nSubject: hi\n\nBody".to_string();
+        strip_excluded_recipients_in_tpl(&mut tpl);
+        assert!(!tpl.contains("ludo@viteunetable.com"));
+        assert!(tpl.contains("bob@example.com"));
+        assert!(tpl.contains("alice@example.com"));
+    }
+
+    #[test]
+    fn strip_recipient_tpl_not_present() {
+        let original = "From: a@example.com\nTo: bob@example.com\nSubject: hi\n\nBody".to_string();
+        let mut tpl = original.clone();
+        strip_excluded_recipients_in_tpl(&mut tpl);
+        assert_eq!(tpl, original);
     }
 
     /// Helper to decode Base64 for test verification

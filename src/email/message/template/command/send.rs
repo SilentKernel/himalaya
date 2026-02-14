@@ -76,6 +76,7 @@ impl TemplateSendCommand {
 
         let msg = compiler.build(tpl.as_str())?.compile().await?.into_vec()?;
 
+        let msg = crate::from_override::strip_excluded_recipients_in_raw_message(&msg);
         let msg = crate::from_override::override_from_in_raw_message(&msg);
         let msg = crate::from_override::inject_cc_in_raw_message(&msg);
         let msg = crate::from_override::encode_address_headers(&msg);
