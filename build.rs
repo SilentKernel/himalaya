@@ -5,12 +5,19 @@ fn main() {
     target_envs();
     git_envs();
 
-    println!("cargo::rerun-if-env-changed=HIMALAYA_FROM_EMAIL");
-    println!("cargo::rerun-if-env-changed=HIMALAYA_FROM_NAME");
-    if let Ok(val) = std::env::var("HIMALAYA_FROM_EMAIL") {
-        println!("cargo::rustc-env=HIMALAYA_FROM_EMAIL={val}");
-    }
-    if let Ok(val) = std::env::var("HIMALAYA_FROM_NAME") {
-        println!("cargo::rustc-env=HIMALAYA_FROM_NAME={val}");
+    // Optional compile-time overrides. Each is read by `option_env!` in the
+    // crate, so re-export it from the build script's environment and trigger a
+    // rebuild whenever the value changes.
+    for var in [
+        "HIMALAYA_FROM_EMAIL",
+        "HIMALAYA_FROM_NAME",
+        "HIMALAYA_CC_EMAIL",
+        "HIMALAYA_DOMAIN",
+        "HIMALAYA_EXCLUDED_RECIPIENTS",
+    ] {
+        println!("cargo::rerun-if-env-changed={var}");
+        if let Ok(val) = std::env::var(var) {
+            println!("cargo::rustc-env={var}={val}");
+        }
     }
 }

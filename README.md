@@ -184,31 +184,68 @@ himalaya envelope list --account posteo --folder Archives.FOSS --page 2
 </details>
 
 <details>
-  <summary>Sources</summary>
+  <summary>Sources (Ubuntu 26.04)</summary>
 
-  Himalaya CLI can be installed from sources.
+  This fork is built from sources. The steps below target **Ubuntu 26.04**.
 
-  First you need to install the Rust development environment (see the [rust installation documentation](https://doc.rust-lang.org/cargo/getting-started/installation.html)):
+  **1. Install the system build dependencies**
+
+  ```
+  sudo apt update
+  sudo apt install -y build-essential pkg-config cmake libssl-dev zlib1g-dev git curl
+  ```
+
+  > The default feature set (`imap`, `maildir`, `smtp`, `sendmail`, `wizard`,
+  > `pgp-commands`) only needs the packages above. If you build with extra
+  > features, also install: `libnotmuch-dev` (for `notmuch`) and
+  > `libgpgme-dev` (for `pgp-gpg`).
+
+  **2. Install the Rust toolchain**
+
+  The project is pinned to Rust **1.82** via [`rust-toolchain.toml`](./rust-toolchain.toml),
+  so install Rust with [rustup](https://rustup.rs) (the pinned version is selected
+  automatically — do not use the older `apt` `rustc`):
 
   ```
   curl https://sh.rustup.rs -sSf | sh
+  source "$HOME/.cargo/env"
   ```
 
-  Then, you need to clone the repository and install dependencies:
+  **3. Clone and build**
 
   ```
-  git clone https://github.com/pimalaya/himalaya.git
+  git clone https://github.com/SilentKernel/himalaya.git
   cd himalaya
-  cargo check
-  ```
-
-  Now, you can build Himalaya:
-
-  ```
   cargo build --release
   ```
 
-  *Binaries are available under the `target/release` folder.*
+  *The binary is available at `target/release/himalaya`.*
+
+  ### Build-time configuration
+
+  This fork supports a few **compile-time** overrides, passed as environment
+  variables to `cargo build`. All are **optional** — omit them for stock
+  behavior. Because they are baked in at compile time, changing a value requires
+  a rebuild.
+
+  | Build argument                 | Effect when set                                                              |
+  | ------------------------------ | --------------------------------------------------------------------------- |
+  | `HIMALAYA_FROM_EMAIL`          | Forces the `From:` address on every outgoing message.                       |
+  | `HIMALAYA_FROM_NAME`           | Forces the `From:` display name (non-ASCII is RFC 2047 encoded).            |
+  | `HIMALAYA_CC_EMAIL`            | Address automatically added to `Cc:` on every outgoing message.             |
+  | `HIMALAYA_EXCLUDED_RECIPIENTS` | Comma-separated addresses always stripped from `To:`/`Cc:`/`Bcc:` on send.  |
+  | `HIMALAYA_DOMAIN`              | Domain used when generating the `Message-ID` (defaults to `localhost`).     |
+
+  Example release build with overrides:
+
+  ```
+  HIMALAYA_FROM_EMAIL="me@example.com" \
+  HIMALAYA_FROM_NAME="My Name" \
+  HIMALAYA_CC_EMAIL="me@backup.com" \
+  HIMALAYA_EXCLUDED_RECIPIENTS="old@example.com, noreply@example.com" \
+  HIMALAYA_DOMAIN="example.com" \
+  cargo build --release
+  ```
 </details>
 
 ## Configuration

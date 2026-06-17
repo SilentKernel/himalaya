@@ -337,11 +337,27 @@ pub fn override_from_in_raw_message(msg: &[u8]) -> Vec<u8> {
     result.into_bytes()
 }
 
-const EXCLUDED_RECIPIENTS: &[&str] = &[
-    "ludo@viteunetable.com",
-];
+/// Comma-separated list of recipient addresses to strip from outgoing
+/// messages, supplied at compile time via `HIMALAYA_EXCLUDED_RECIPIENTS`.
+/// Unset means no recipient is excluded.
+const EXCLUDED_RECIPIENTS_RAW: Option<&str> = option_env!("HIMALAYA_EXCLUDED_RECIPIENTS");
 
-const CC_EMAIL: &str = "ludo@hey.com";
+/// Address auto-added to `Cc:` on every outgoing message, supplied at compile
+/// time via `HIMALAYA_CC_EMAIL`. Unset means no address is injected.
+const CC_EMAIL: Option<&str> = option_env!("HIMALAYA_CC_EMAIL");
+
+/// Parse the compile-time excluded-recipients list into individual,
+/// non-empty, trimmed addresses.
+fn excluded_recipients() -> Vec<&'static str> {
+    match EXCLUDED_RECIPIENTS_RAW {
+        Some(raw) => raw
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        None => Vec::new(),
+    }
+}
 
 /// Extract the email address portion from an address token like
 /// `Display Name <addr@example.com>` or bare `addr@example.com`.
@@ -356,9 +372,9 @@ fn extract_email(token: &str) -> &str {
 }
 
 /// Return true if `token` contains any of the excluded email addresses.
-fn is_excluded(token: &str) -> bool {
+fn is_excluded(token: &str, excluded: &[&str]) -> bool {
     let email = extract_email(token).trim();
-    EXCLUDED_RECIPIENTS
+    excluded
         .iter()
         .any(|excl| email.eq_ignore_ascii_case(excl))
 }
@@ -367,6 +383,14 @@ fn is_excluded(token: &str) -> bool {
 /// RFC 5322 message (`\r\n` line endings). If a header becomes empty
 /// after removal, the entire header line is removed.
 pub fn strip_excluded_recipients_in_raw_message(msg: &[u8]) -> Vec<u8> {
+    let excluded = excluded_recipients();
+    if excluded.is_empty() {
+        return msg.to_vec();
+    }
+    strip_excluded_recipients_in_raw_message_with(msg, &excluded)
+}
+
+fn strip_excluded_recipients_in_raw_message_with(msg: &[u8], excluded: &[&str]) -> Vec<u8> {
     const ADDR_HEADERS: &[&str] = &["to:", "cc:", "bcc:"];
 
     let src = String::from_utf8_lossy(msg);
@@ -411,7 +435,7 @@ pub fn strip_excluded_recipients_in_raw_message(msg: &[u8]) -> Vec<u8> {
             .split(',')
             .map(|a| a.trim())
             .filter(|a| !a.is_empty())
-            .filter(|a| !is_excluded(a))
+            .filter(|a| !is_excluded(a, excluded))
             .collect();
 
         if addrs.is_empty() {
@@ -436,6 +460,14 @@ pub fn strip_excluded_recipients_in_raw_message(msg: &[u8]) -> Vec<u8> {
 /// Strip excluded recipients from To, Cc, and Bcc headers in a
 /// template string (`\n` line endings).
 pub fn strip_excluded_recipients_in_tpl(content: &mut String) {
+    let excluded = excluded_recipients();
+    if excluded.is_empty() {
+        return;
+    }
+    strip_excluded_recipients_in_tpl_with(content, &excluded);
+}
+
+fn strip_excluded_recipients_in_tpl_with(content: &mut String, excluded: &[&str]) {
     const ADDR_HEADERS: &[&str] = &["to:", "cc:", "bcc:"];
 
     let src = content.clone();
@@ -477,7 +509,7 @@ pub fn strip_excluded_recipients_in_tpl(content: &mut String) {
             .split(',')
             .map(|a| a.trim())
             .filter(|a| !a.is_empty())
-            .filter(|a| !is_excluded(a))
+            .filter(|a| !is_excluded(a, excluded))
             .collect();
 
         if addrs.is_empty() {
@@ -497,6 +529,13 @@ pub fn strip_excluded_recipients_in_tpl(content: &mut String) {
 /// `CC_EMAIL`. If the header is missing, one is inserted. If it
 /// already lists `CC_EMAIL`, the message is returned unchanged.
 pub fn inject_cc_in_raw_message(msg: &[u8]) -> Vec<u8> {
+    match CC_EMAIL {
+        Some(cc_email) => inject_cc_in_raw_message_with(msg, cc_email),
+        None => msg.to_vec(),
+    }
+}
+
+fn inject_cc_in_raw_message_with(msg: &[u8], cc_email: &str) -> Vec<u8> {
     let src = String::from_utf8_lossy(msg);
 
     // Collect the full Cc and To header values (may be folded across lines).
@@ -556,13 +595,13 @@ pub fn inject_cc_in_raw_message(msg: &[u8]) -> Vec<u8> {
     }
 
     // Already present in Cc or To?
-    if cc_value.to_ascii_lowercase().contains(CC_EMAIL)
-        || to_value.to_ascii_lowercase().contains(CC_EMAIL)
+    if cc_value.to_ascii_lowercase().contains(cc_email)
+        || to_value.to_ascii_lowercase().contains(cc_email)
     {
         return msg.to_vec();
     }
 
-    let mut result = String::with_capacity(src.len() + CC_EMAIL.len() + 10);
+    let mut result = String::with_capacity(src.len() + cc_email.len() + 10);
 
     if let Some(start) = cc_start {
         // Existing Cc header — append our address
@@ -570,21 +609,21 @@ pub fn inject_cc_in_raw_message(msg: &[u8]) -> Vec<u8> {
         let old_value = src[start..cc_end].trim_end_matches(|c| c == '\r' || c == '\n');
         result.push_str(old_value);
         result.push_str(", ");
-        result.push_str(CC_EMAIL);
+        result.push_str(cc_email);
         result.push_str("\r\n");
         result.push_str(&src[cc_end..]);
     } else if let Some(sep) = header_end {
         // No Cc header — insert one before the blank line
         result.push_str(&src[..sep]);
         result.push_str("Cc: ");
-        result.push_str(CC_EMAIL);
+        result.push_str(cc_email);
         result.push_str("\r\n");
         result.push_str(&src[sep..]);
     } else {
         // No blank separator found (unusual) — append at end
         result.push_str(&src);
         result.push_str("Cc: ");
-        result.push_str(CC_EMAIL);
+        result.push_str(cc_email);
         result.push_str("\r\n");
     }
 
@@ -594,6 +633,12 @@ pub fn inject_cc_in_raw_message(msg: &[u8]) -> Vec<u8> {
 /// Ensure the `Cc:` header in a template string contains `CC_EMAIL`.
 /// Templates use `\n` line endings and the same `Header: value` format.
 pub fn inject_cc_in_tpl(content: &mut String) {
+    if let Some(cc_email) = CC_EMAIL {
+        inject_cc_in_tpl_with(content, cc_email);
+    }
+}
+
+fn inject_cc_in_tpl_with(content: &mut String, cc_email: &str) {
     // Find existing Cc and To headers in template text (plain \n line endings)
     let mut cc_value = String::new();
     let mut to_value = String::new();
@@ -648,8 +693,8 @@ pub fn inject_cc_in_tpl(content: &mut String) {
         }
     }
 
-    if cc_value.to_ascii_lowercase().contains(CC_EMAIL)
-        || to_value.to_ascii_lowercase().contains(CC_EMAIL)
+    if cc_value.to_ascii_lowercase().contains(cc_email)
+        || to_value.to_ascii_lowercase().contains(cc_email)
     {
         return;
     }
@@ -658,13 +703,13 @@ pub fn inject_cc_in_tpl(content: &mut String) {
         let old = content[start..cc_end]
             .trim_end_matches(|c: char| c == '\r' || c == '\n')
             .to_string();
-        let replacement = format!("{}, {}\n", old, CC_EMAIL);
+        let replacement = format!("{}, {}\n", old, cc_email);
         content.replace_range(start..cc_end, &replacement);
     } else if let Some(sep) = header_end {
-        let insertion = format!("Cc: {}\n", CC_EMAIL);
+        let insertion = format!("Cc: {}\n", cc_email);
         content.insert_str(sep, &insertion);
     } else {
-        content.push_str(&format!("Cc: {}\n", CC_EMAIL));
+        content.push_str(&format!("Cc: {}\n", cc_email));
     }
 }
 
@@ -923,43 +968,59 @@ mod tests {
         assert_eq!(result, msg.to_vec());
     }
 
+    // Fixed Cc address used by the inject tests so they are deterministic
+    // regardless of the compile-time `HIMALAYA_CC_EMAIL` value.
+    const TEST_CC: &str = "cc-bot@example.com";
+
     // --- inject_cc_in_raw_message tests ---
 
     #[test]
     fn inject_cc_raw_no_cc_header() {
         let msg = b"From: a@example.com\r\nSubject: hi\r\n\r\nBody";
-        let result = inject_cc_in_raw_message(msg);
+        let result = inject_cc_in_raw_message_with(msg, TEST_CC);
         let text = String::from_utf8(result).unwrap();
-        assert!(text.contains(&format!("Cc: {}", CC_EMAIL)));
+        assert!(text.contains(&format!("Cc: {}", TEST_CC)));
         assert!(text.contains("\r\n\r\nBody"));
     }
 
     #[test]
     fn inject_cc_raw_existing_cc_without_target() {
         let msg = b"From: a@example.com\r\nCc: other@example.com\r\nSubject: hi\r\n\r\nBody";
-        let result = inject_cc_in_raw_message(msg);
+        let result = inject_cc_in_raw_message_with(msg, TEST_CC);
         let text = String::from_utf8(result).unwrap();
         assert!(text.contains("other@example.com"));
-        assert!(text.contains(CC_EMAIL));
+        assert!(text.contains(TEST_CC));
     }
 
     #[test]
     fn inject_cc_raw_already_present() {
         let msg = format!(
             "From: a@example.com\r\nCc: {}\r\nSubject: hi\r\n\r\nBody",
-            CC_EMAIL
+            TEST_CC
         );
-        let result = inject_cc_in_raw_message(msg.as_bytes());
+        let result = inject_cc_in_raw_message_with(msg.as_bytes(), TEST_CC);
         assert_eq!(result, msg.as_bytes().to_vec());
     }
 
     #[test]
     fn inject_cc_raw_folded_header() {
         let msg = b"From: a@example.com\r\nCc: first@example.com,\r\n second@example.com\r\nSubject: hi\r\n\r\nBody";
-        let result = inject_cc_in_raw_message(msg);
+        let result = inject_cc_in_raw_message_with(msg, TEST_CC);
         let text = String::from_utf8(result).unwrap();
-        assert!(text.contains(CC_EMAIL));
+        assert!(text.contains(TEST_CC));
         assert!(text.contains("first@example.com"));
+    }
+
+    #[test]
+    fn inject_cc_raw_noop_when_unset() {
+        // The public wrapper must leave the message untouched when no
+        // `HIMALAYA_CC_EMAIL` was compiled in.
+        if CC_EMAIL.is_some() {
+            return;
+        }
+        let msg = b"From: a@example.com\r\nSubject: hi\r\n\r\nBody";
+        let result = inject_cc_in_raw_message(msg);
+        assert_eq!(result, msg.to_vec());
     }
 
     // --- inject_cc_in_tpl tests ---
@@ -967,27 +1028,27 @@ mod tests {
     #[test]
     fn inject_cc_tpl_no_cc_header() {
         let mut tpl = "From: a@example.com\nSubject: hi\n\nBody".to_string();
-        inject_cc_in_tpl(&mut tpl);
-        assert!(tpl.contains(&format!("Cc: {}", CC_EMAIL)));
+        inject_cc_in_tpl_with(&mut tpl, TEST_CC);
+        assert!(tpl.contains(&format!("Cc: {}", TEST_CC)));
         assert!(tpl.contains("\n\nBody"));
     }
 
     #[test]
     fn inject_cc_tpl_existing_cc_without_target() {
         let mut tpl = "From: a@example.com\nCc: other@example.com\nSubject: hi\n\nBody".to_string();
-        inject_cc_in_tpl(&mut tpl);
+        inject_cc_in_tpl_with(&mut tpl, TEST_CC);
         assert!(tpl.contains("other@example.com"));
-        assert!(tpl.contains(CC_EMAIL));
+        assert!(tpl.contains(TEST_CC));
     }
 
     #[test]
     fn inject_cc_tpl_already_present() {
         let original = format!(
             "From: a@example.com\nCc: {}\nSubject: hi\n\nBody",
-            CC_EMAIL
+            TEST_CC
         );
         let mut tpl = original.clone();
-        inject_cc_in_tpl(&mut tpl);
+        inject_cc_in_tpl_with(&mut tpl, TEST_CC);
         assert_eq!(tpl, original);
     }
 
@@ -995,23 +1056,34 @@ mod tests {
     fn inject_cc_tpl_already_present_among_others() {
         let original = format!(
             "From: a@example.com\nCc: other@example.com, {}\nSubject: hi\n\nBody",
-            CC_EMAIL
+            TEST_CC
         );
+        let mut tpl = original.clone();
+        inject_cc_in_tpl_with(&mut tpl, TEST_CC);
+        assert_eq!(tpl, original);
+    }
+
+    #[test]
+    fn inject_cc_tpl_noop_when_unset() {
+        if CC_EMAIL.is_some() {
+            return;
+        }
+        let original = "From: a@example.com\nSubject: hi\n\nBody".to_string();
         let mut tpl = original.clone();
         inject_cc_in_tpl(&mut tpl);
         assert_eq!(tpl, original);
     }
 
-    // --- inject_cc skips when CC_EMAIL is in To: ---
+    // --- inject_cc skips when the Cc address is already in To: ---
 
     #[test]
     fn inject_cc_raw_skips_when_in_to() {
         let msg = format!(
             "From: a@example.com\r\nTo: {}\r\nSubject: hi\r\n\r\nBody",
-            CC_EMAIL
+            TEST_CC
         );
         let original = msg.as_bytes().to_vec();
-        let result = inject_cc_in_raw_message(msg.as_bytes());
+        let result = inject_cc_in_raw_message_with(msg.as_bytes(), TEST_CC);
         assert_eq!(result, original);
     }
 
@@ -1019,10 +1091,10 @@ mod tests {
     fn inject_cc_raw_skips_when_in_to_among_others() {
         let msg = format!(
             "From: a@example.com\r\nTo: other@x.com, {}\r\nSubject: hi\r\n\r\nBody",
-            CC_EMAIL
+            TEST_CC
         );
         let original = msg.as_bytes().to_vec();
-        let result = inject_cc_in_raw_message(msg.as_bytes());
+        let result = inject_cc_in_raw_message_with(msg.as_bytes(), TEST_CC);
         assert_eq!(result, original);
     }
 
@@ -1030,10 +1102,10 @@ mod tests {
     fn inject_cc_tpl_skips_when_in_to() {
         let original = format!(
             "From: a@example.com\nTo: {}\nSubject: hi\n\nBody",
-            CC_EMAIL
+            TEST_CC
         );
         let mut tpl = original.clone();
-        inject_cc_in_tpl(&mut tpl);
+        inject_cc_in_tpl_with(&mut tpl, TEST_CC);
         assert_eq!(tpl, original);
     }
 
@@ -1041,10 +1113,10 @@ mod tests {
     fn inject_cc_tpl_skips_when_in_to_among_others() {
         let original = format!(
             "From: a@example.com\nTo: other@x.com, {}\nSubject: hi\n\nBody",
-            CC_EMAIL
+            TEST_CC
         );
         let mut tpl = original.clone();
-        inject_cc_in_tpl(&mut tpl);
+        inject_cc_in_tpl_with(&mut tpl, TEST_CC);
         assert_eq!(tpl, original);
     }
 
@@ -1383,41 +1455,46 @@ mod tests {
         );
     }
 
+    // Fixed exclusion list used by the strip tests so they are deterministic
+    // regardless of the compile-time `HIMALAYA_EXCLUDED_RECIPIENTS` value. The
+    // mixed-case entry also exercises case-insensitive matching.
+    const TEST_EXCLUDED: &[&str] = &["blocked@example.com", "Cap@Example.Com"];
+
     // --- strip_excluded_recipients_in_raw_message tests ---
 
     #[test]
     fn strip_recipient_raw_from_to() {
-        let msg = b"From: a@example.com\r\nTo: ludo@viteunetable.com\r\nSubject: hi\r\n\r\nBody";
-        let result = strip_excluded_recipients_in_raw_message(msg);
+        let msg = b"From: a@example.com\r\nTo: blocked@example.com\r\nSubject: hi\r\n\r\nBody";
+        let result = strip_excluded_recipients_in_raw_message_with(msg, TEST_EXCLUDED);
         let text = String::from_utf8(result).unwrap();
-        assert!(!text.contains("ludo@viteunetable.com"));
+        assert!(!text.contains("blocked@example.com"));
         assert!(!text.contains("To:"));
     }
 
     #[test]
     fn strip_recipient_raw_from_cc() {
-        let msg = b"From: a@example.com\r\nCc: ludo@viteunetable.com\r\nSubject: hi\r\n\r\nBody";
-        let result = strip_excluded_recipients_in_raw_message(msg);
+        let msg = b"From: a@example.com\r\nCc: blocked@example.com\r\nSubject: hi\r\n\r\nBody";
+        let result = strip_excluded_recipients_in_raw_message_with(msg, TEST_EXCLUDED);
         let text = String::from_utf8(result).unwrap();
-        assert!(!text.contains("ludo@viteunetable.com"));
+        assert!(!text.contains("blocked@example.com"));
         assert!(!text.contains("Cc:"));
     }
 
     #[test]
     fn strip_recipient_raw_from_bcc() {
-        let msg = b"From: a@example.com\r\nBcc: ludo@viteunetable.com\r\nSubject: hi\r\n\r\nBody";
-        let result = strip_excluded_recipients_in_raw_message(msg);
+        let msg = b"From: a@example.com\r\nBcc: blocked@example.com\r\nSubject: hi\r\n\r\nBody";
+        let result = strip_excluded_recipients_in_raw_message_with(msg, TEST_EXCLUDED);
         let text = String::from_utf8(result).unwrap();
-        assert!(!text.contains("ludo@viteunetable.com"));
+        assert!(!text.contains("blocked@example.com"));
         assert!(!text.contains("Bcc:"));
     }
 
     #[test]
     fn strip_recipient_raw_among_others() {
-        let msg = b"From: a@example.com\r\nTo: bob@example.com, ludo@viteunetable.com, alice@example.com\r\nSubject: hi\r\n\r\nBody";
-        let result = strip_excluded_recipients_in_raw_message(msg);
+        let msg = b"From: a@example.com\r\nTo: bob@example.com, blocked@example.com, alice@example.com\r\nSubject: hi\r\n\r\nBody";
+        let result = strip_excluded_recipients_in_raw_message_with(msg, TEST_EXCLUDED);
         let text = String::from_utf8(result).unwrap();
-        assert!(!text.contains("ludo@viteunetable.com"));
+        assert!(!text.contains("blocked@example.com"));
         assert!(text.contains("bob@example.com"));
         assert!(text.contains("alice@example.com"));
         assert!(text.contains("To:"));
@@ -1426,14 +1503,14 @@ mod tests {
     #[test]
     fn strip_recipient_raw_not_present() {
         let msg = b"From: a@example.com\r\nTo: bob@example.com\r\nSubject: hi\r\n\r\nBody";
-        let result = strip_excluded_recipients_in_raw_message(msg);
+        let result = strip_excluded_recipients_in_raw_message_with(msg, TEST_EXCLUDED);
         assert_eq!(result, msg.to_vec());
     }
 
     #[test]
     fn strip_recipient_raw_empty_header_removed() {
-        let msg = b"From: a@example.com\r\nTo: ludo@viteunetable.com\r\nCc: bob@example.com\r\nSubject: hi\r\n\r\nBody";
-        let result = strip_excluded_recipients_in_raw_message(msg);
+        let msg = b"From: a@example.com\r\nTo: blocked@example.com\r\nCc: bob@example.com\r\nSubject: hi\r\n\r\nBody";
+        let result = strip_excluded_recipients_in_raw_message_with(msg, TEST_EXCLUDED);
         let text = String::from_utf8(result).unwrap();
         assert!(!text.contains("To:"));
         assert!(text.contains("Cc: bob@example.com"));
@@ -1443,36 +1520,48 @@ mod tests {
 
     #[test]
     fn strip_recipient_raw_with_display_name() {
-        let msg = b"From: a@example.com\r\nTo: Ludo <ludo@viteunetable.com>, bob@example.com\r\n\r\nBody";
-        let result = strip_excluded_recipients_in_raw_message(msg);
+        let msg = b"From: a@example.com\r\nTo: Blocked <blocked@example.com>, bob@example.com\r\n\r\nBody";
+        let result = strip_excluded_recipients_in_raw_message_with(msg, TEST_EXCLUDED);
         let text = String::from_utf8(result).unwrap();
-        assert!(!text.contains("viteunetable"));
+        assert!(!text.contains("blocked@example.com"));
         assert!(text.contains("bob@example.com"));
     }
 
     #[test]
     fn strip_recipient_raw_case_insensitive() {
-        let msg = b"From: a@example.com\r\nTo: Ludo@ViteUneTable.COM\r\n\r\nBody";
-        let result = strip_excluded_recipients_in_raw_message(msg);
+        let msg = b"From: a@example.com\r\nTo: CAP@example.COM\r\n\r\nBody";
+        let result = strip_excluded_recipients_in_raw_message_with(msg, TEST_EXCLUDED);
         let text = String::from_utf8(result).unwrap();
         assert!(!text.contains("To:"));
+    }
+
+    #[test]
+    fn strip_recipient_raw_noop_when_no_exclusions() {
+        // The public wrapper must leave the message untouched when no
+        // `HIMALAYA_EXCLUDED_RECIPIENTS` were compiled in.
+        if !excluded_recipients().is_empty() {
+            return;
+        }
+        let msg = b"From: a@example.com\r\nTo: anyone@example.com\r\nSubject: hi\r\n\r\nBody";
+        let result = strip_excluded_recipients_in_raw_message(msg);
+        assert_eq!(result, msg.to_vec());
     }
 
     // --- strip_excluded_recipients_in_tpl tests ---
 
     #[test]
     fn strip_recipient_tpl_from_to() {
-        let mut tpl = "From: a@example.com\nTo: ludo@viteunetable.com\nSubject: hi\n\nBody".to_string();
-        strip_excluded_recipients_in_tpl(&mut tpl);
-        assert!(!tpl.contains("ludo@viteunetable.com"));
+        let mut tpl = "From: a@example.com\nTo: blocked@example.com\nSubject: hi\n\nBody".to_string();
+        strip_excluded_recipients_in_tpl_with(&mut tpl, TEST_EXCLUDED);
+        assert!(!tpl.contains("blocked@example.com"));
         assert!(!tpl.contains("To:"));
     }
 
     #[test]
     fn strip_recipient_tpl_among_others() {
-        let mut tpl = "From: a@example.com\nTo: bob@example.com, ludo@viteunetable.com, alice@example.com\nSubject: hi\n\nBody".to_string();
-        strip_excluded_recipients_in_tpl(&mut tpl);
-        assert!(!tpl.contains("ludo@viteunetable.com"));
+        let mut tpl = "From: a@example.com\nTo: bob@example.com, blocked@example.com, alice@example.com\nSubject: hi\n\nBody".to_string();
+        strip_excluded_recipients_in_tpl_with(&mut tpl, TEST_EXCLUDED);
+        assert!(!tpl.contains("blocked@example.com"));
         assert!(tpl.contains("bob@example.com"));
         assert!(tpl.contains("alice@example.com"));
     }
@@ -1481,8 +1570,35 @@ mod tests {
     fn strip_recipient_tpl_not_present() {
         let original = "From: a@example.com\nTo: bob@example.com\nSubject: hi\n\nBody".to_string();
         let mut tpl = original.clone();
+        strip_excluded_recipients_in_tpl_with(&mut tpl, TEST_EXCLUDED);
+        assert_eq!(tpl, original);
+    }
+
+    #[test]
+    fn strip_recipient_tpl_noop_when_no_exclusions() {
+        if !excluded_recipients().is_empty() {
+            return;
+        }
+        let original = "From: a@example.com\nTo: anyone@example.com\nSubject: hi\n\nBody".to_string();
+        let mut tpl = original.clone();
         strip_excluded_recipients_in_tpl(&mut tpl);
         assert_eq!(tpl, original);
+    }
+
+    // --- excluded_recipients() parsing ---
+
+    #[test]
+    fn excluded_recipients_parsing_matches_env() {
+        // The parsed list must reflect the compile-time env exactly: empty when
+        // unset, trimmed/non-empty entries otherwise.
+        match EXCLUDED_RECIPIENTS_RAW {
+            None => assert!(excluded_recipients().is_empty()),
+            Some(raw) => {
+                let expected = raw.split(',').filter(|s| !s.trim().is_empty()).count();
+                assert_eq!(excluded_recipients().len(), expected);
+                assert!(excluded_recipients().iter().all(|e| !e.is_empty()));
+            }
+        }
     }
 
     /// Helper to decode Base64 for test verification
